@@ -2,6 +2,8 @@
 
 Nintendo Switch 1 / Atmosphère 1.6.2 target overlay for **FINAL FANTASY XII THE ZODIAC AGE**.
 
+Current version: **0.3.0**
+
 This is an RNG monitor and optional RNG lock for Tesla overlays. By default it only reads the live MT19937 object and predicts future outputs. Enabling the lock writes the MT19937 state while the lock remains enabled.
 
 Target Title ID:
@@ -12,7 +14,8 @@ Target Title ID:
 
 - The overlay builds successfully with the current devkitPro container.
 - The generated overlay is listed and launchable from Tesla-Menu 1.1.2 with nx-ovlloader 1.0.6.
-- Build output: `ovlff12rng.ovl` (approximately 313 KB with embedded NACP metadata).
+- Optional single-value RNG% locking with a background worker thread.
+- Build output: `ovlff12rng.ovl` (approximately 341 KB with embedded NACP metadata).
 - The host-side prediction tests can run without devkitPro.
 - The default configuration targets Switch build `C2932C4D1C84ED7D`.
 
@@ -29,24 +32,29 @@ Validated target build ID:
 - Reads the MT19937 state (624 x 32-bit words) and index.
 - Reconstructs/peeks future MT19937 outputs.
 - Displays the raw RNG, `RNG % 100`, the next N percentage values, and a configurable success probability/range in the Tesla overlay.
-- Can lock the next RNG percentages to one value or a repeating comma-separated pattern.
+- Can lock the next RNG percentage to a single selected value.
 
 ## RNG lock
 
 Version 0.3.0 adds an optional write mode:
 
-- Select the first three **Pattern value** items to cycle values in the range `00..99`. Each press advances by one and wraps from `99` to `00`.
-- Select **Pattern length** to cycle through `1`, `2`, and `3`. For example, values `99`, `60`, `70` with length `1` lock `99`; length `2` locks `99,60`; length `3` locks `99,60,70`.
-- Select **Lock** to write the pattern into the current and future MT19937 state words.
-- With a single value, every subsequent game RNG draw resolves to that percentage.
-- With a pattern, values repeat in order and wrap back to the first value.
+- Select **Lock value** to cycle the desired value in the range `00..99`. Each press advances by one and wraps from `99` to `00`.
+- Select **Lock** to write that single value into the current and future MT19937 state words.
+- Every subsequent game RNG draw resolves to the selected percentage while the lock remains enabled.
 - Select **Lock** again to turn the lock off.
 
 The lock preserves the high-order bits of each tempered output, changing only the value modulo 100. This minimizes distortion while forcing the displayed and game-facing percentage. Because FFXII TZA uses standard MT19937, the UI prediction is generated from the same state that the lock writes.
 
-The lock is continuously reasserted while the overlay is open: every refresh first reads the live state, then rewrites it if needed. Returning to the Tesla plugin list and reopening the overlay creates a new GUI instance, so **Lock** returns to `OFF`; this does not persist a lock after leaving the plugin. Leaving the overlay while Tesla remains in the foreground can also stop refresh callbacks, so turn the lock off before closing the overlay when persistence is not desired.
+While **Lock** is enabled, a lightweight worker thread reasserts the lock approximately every 50 ms. The lock therefore continues after focus returns to the game and survives MT19937 twists that reset `mti` to `0/624`. Returning to the Tesla plugin list destroys the plugin GUI and disables the lock; reopening it shows **Lock** as `OFF`, which is expected. Press **Lock** again to re-enable it.
 
 Locking modifies live game memory through `dmnt:cht -> WriteCheatProcessMemory`. Keep the feature disabled while you want pure observation.
+
+### Important lock semantics
+
+- The lock controls `RNG % 100`, not the complete 32-bit raw RNG value.
+- The high-order bits of each MT19937 output remain variable, so formulas that use the full raw value can still produce different results. This is expected for actions such as Cure, whose healing calculation can consume more information than the two-digit percentage view.
+- A fixed full-raw-value lock would require preserving or choosing one exact 32-bit value; the current version intentionally does not do that.
+- If the plugin UI is open, its regular refresh also maintains the lock. When focus returns to the game, the dedicated worker thread continues maintaining it every approximately 50 ms.
 
 ## Important FFXII RNG note
 
@@ -200,10 +208,11 @@ The file must be a regular file with that exact name. Verify that it is not `con
 - If Docker cannot resolve the devkitPro image, pull the image explicitly with `docker pull devkitpro/devkita64`, then rerun `./build-docker.sh`.
 - Confirm that `lib/libtesla` is initialized before using a local devkitPro toolchain.
 - If Tesla-Menu does not list the plugin, verify that `sdmc:/switch/.overlays/ovlff12rng.ovl` is the newly built file. Tesla-Menu 1.1.2 silently skips overlays without embedded NACP metadata.
-- The compatible build embeds NACP metadata and is approximately 313 KB. Older approximately 296 KB builds were generated without NACP and are not listed by Tesla-Menu.
+- The compatible v0.3.0 build embeds NACP metadata and is approximately 341 KB. Older builds without NACP or with the previous pattern-lock UI should be replaced.
 - Replace the `.ovl` file while Tesla is closed or from a PC, then reboot the console. Do not merely rename or copy alongside the old file; the exact path above must contain the new build.
 - If the overlay still reports `CONFIG ERROR / cannot open config`, verify the exact SD-card path above. The overlay handles mounting the SD card internally; no separate mount step is required.
-- If the status is online but percentages look wrong, compare the displayed pointer chain (`Ptr`, `State`, `Mti`) with a memory editor. The overlay is read-only and will not repair a mismatched build.
+- If the status is online but percentages look wrong, compare the displayed pointer chain (`Slot`, `Obj`, `State`, `Mti`) with a memory editor. The lock should only be used on the validated build.
+- If the lock appears to stop after MT19937 wraps to `Mti: 0/624`, install the v0.3.0 build with the background lock worker. Older builds only rewrote the state while the plugin UI was actively refreshing.
 
 ## dmnt API correction
 
@@ -215,9 +224,10 @@ The overlay intentionally uses the `dmnt:cht` path instead of opening its own de
 
 1. The default RNG offsets are build-specific and target `C2932C4D1C84ED7D`; another game update needs a new pointer-chain offset set.
 2. The optional RNG lock modifies the MT19937 state; it is off unless explicitly enabled.
-3. The displayed percentage is a derived `MT19937 output % 100`, matching the convention used by public FFXII TZA RNG helper tools; it is not a universal statement that every game action has that exact probability rule.
-4. Reading the state and index is a live-memory snapshot; the game may advance the RNG concurrently with the read. The implementation minimizes this window by reading the configured state/index span in one dmnt transaction.
-5. The UI displays a compact preview, while the reader internally captures all 624 state words required for MT19937 prediction.
+3. The lock fixes the derived percentage, not the full 32-bit raw value; game formulas using the full raw value may still vary.
+4. The displayed percentage is a derived `MT19937 output % 100`, matching the convention used by public FFXII TZA RNG helper tools; it is not a universal statement that every game action has that exact probability rule.
+5. Reading the state and index is a live-memory snapshot; the game may advance the RNG concurrently with the read. The implementation minimizes this window by reading the configured state/index span in one dmnt transaction.
+6. The UI displays a compact preview, while the reader internally captures all 624 state words required for MT19937 prediction.
 
 ## Source layout
 

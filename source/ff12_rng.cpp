@@ -254,18 +254,11 @@ Result RngTracker::Refresh(const DmntCheatProcessMetadata& meta) {
     return ReadRng(meta, object_address);
 }
 
-Result RngTracker::LockPercentages(const std::vector<uint32_t>& percentages) {
+Result RngTracker::LockPercentage(uint32_t percentage) {
     m_lock_error.clear();
-    if (percentages.empty()) {
-        m_lock_error = "empty pattern";
+    if (percentage > 99) {
+        m_lock_error = "percent must be 0..99";
         return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-    }
-
-    for (const uint32_t percent : percentages) {
-        if (percent > 99) {
-            m_lock_error = "percent must be 0..99";
-            return MAKERESULT(Module_Libnx, LibnxError_BadInput);
-        }
     }
     if (!m_snapshot.valid) {
         m_lock_error = "RNG not online";
@@ -278,10 +271,9 @@ Result RngTracker::LockPercentages(const std::vector<uint32_t>& percentages) {
 
     std::array<uint32_t, MT_N> state = m_snapshot.state;
     for (size_t i = 0; i < MT_N; ++i) {
-        const uint32_t target = percentages[(idx + i) % percentages.size()];
         const size_t state_index = (idx + i) % MT_N;
         state[state_index] = Mt19937::Untemper(
-            target + 100U * (Mt19937::Temper(state[state_index]) / 100U));
+            percentage + 100U * (Mt19937::Temper(state[state_index]) / 100U));
     }
 
     const Result state_rc = dmnt::Write(
@@ -300,7 +292,7 @@ Result RngTracker::LockPercentages(const std::vector<uint32_t>& percentages) {
         return index_rc;
     }
 
-    m_lock_pattern = percentages;
+    m_lock_percentage = percentage;
     m_lock_active = true;
     return 0;
 }
@@ -308,12 +300,12 @@ Result RngTracker::LockPercentages(const std::vector<uint32_t>& percentages) {
 Result RngTracker::MaintainLock() {
     if (!m_lock_active)
         return 0;
-    return LockPercentages(m_lock_pattern);
+    return LockPercentage(m_lock_percentage);
 }
 
 void RngTracker::Unlock() {
     m_lock_active = false;
-    m_lock_pattern.clear();
+    m_lock_percentage = 0;
     m_lock_error.clear();
 }
 

@@ -6,11 +6,10 @@
 #include "ff12_rng.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
-#include <cstdlib>
 #include <memory>
 #include <string>
-#include <vector>
 
 namespace {
 
@@ -18,7 +17,49 @@ constexpr uint64_t TARGET_TITLE_ID = 0x0100EB100AB42000ULL;
 constexpr const char* CONFIG_PATH = "sdmc:/config/ff12rng/config.ini";
 constexpr const char* APP_VERSION_TEXT = "0.3.0";
 constexpr uint64_t TICKS_PER_MS_MAX = 1000;
+constexpr s64 LOCK_POLL_NS = 50'000'000LL;
 bool g_sd_mounted = false;
+
+struct LockWorker {
+    ff12::RngTracker* tracker = nullptr;
+    std::atomic<bool> running{false};
+    std::atomic<bool> enabled{false};
+    Thread thread{};
+
+    static void threadFunc(void* arg) {
+        auto* worker = static_cast<LockWorker*>(arg);
+        while (worker->running.load(std::memory_order_acquire)) {
+            if (worker->enabled.load(std::memory_order_acquire))
+                (void)worker->tracker->MaintainLock();
+            svcSleepThread(LOCK_POLL_NS);
+        }
+    }
+
+    bool start(ff12::RngTracker* target) {
+        if (running.load(std::memory_order_acquire))
+            return true;
+        tracker = target;
+        running.store(true, std::memory_order_release);
+        if (R_FAILED(threadCreate(&thread, threadFunc, this, nullptr,
+                                  0x2000, 0x2C, -2))) {
+            running.store(false, std::memory_order_release);
+            return false;
+        }
+        if (R_FAILED(threadStart(&thread))) {
+            running.store(false, std::memory_order_release);
+            threadClose(&thread);
+            return false;
+        }
+        return true;
+    }
+
+    void stop() {
+        if (!running.exchange(false, std::memory_order_acq_rel))
+            return;
+        threadWaitForExit(&thread);
+        threadClose(&thread);
+    }
+};
 
 class MainGui final : public tsl::Gui {
 public:
@@ -28,6 +69,12 @@ public:
         m_cfg_loaded = ff12::LoadConfig(CONFIG_PATH, m_cfg, error);
         if (!m_cfg_loaded) m_config_error = error;
         m_tracker.Configure(m_cfg);
+        m_worker_started = m_worker.start(&m_tracker);
+    }
+
+    ~MainGui() override {
+        m_tracker.Unlock();
+        m_worker.stop();
     }
 
     tsl::elm::Element* createUI() override {
@@ -38,33 +85,20 @@ public:
         list->addItem(new tsl::elm::CustomDrawer(
             [this](tsl::gfx::Renderer* renderer, s32 x, s32 y, s32 w, s32 h) {
                 render(renderer, x, y, w, h);
-            }), 560);
+            }), 450);
 
         list->addItem(new tsl::elm::CategoryHeader("RNG Lock", true));
 
-        for (size_t index = 0; index < 3; ++index) {
-            auto* pattern_item = new tsl::elm::ListItem(
-                "Pattern value", std::to_string(m_pattern_value[index]));
-            pattern_item->setClickListener([this, pattern_item, index](u64 keys) {
-                if (!(keys & HidNpadButton_A))
-                    return false;
-                m_pattern_index = index;
-                applyPattern(pattern_item);
-                return true;
-            });
-            list->addItem(pattern_item);
-        }
-
-        auto* pattern_size_item = new tsl::elm::ListItem(
-            "Pattern length", std::to_string(m_pattern_size));
-        pattern_size_item->setClickListener([this, pattern_size_item](u64 keys) {
+        auto* lock_value_item = new tsl::elm::ListItem(
+            "Lock value", std::to_string(m_lock_value));
+        lock_value_item->setClickListener([this, lock_value_item](u64 keys) {
             if (!(keys & HidNpadButton_A))
                 return false;
-            m_pattern_size = m_pattern_size == 3 ? 1 : m_pattern_size + 1;
-            pattern_size_item->setValue(std::to_string(m_pattern_size));
+            m_lock_value = m_lock_value == 99 ? 0 : m_lock_value + 1;
+            lock_value_item->setValue(std::to_string(m_lock_value));
             return true;
         });
-        list->addItem(pattern_size_item);
+        list->addItem(lock_value_item);
 
         auto* lock_item = new tsl::elm::ListItem(
             "Lock", m_tracker.LockActive() ? "ON" : "OFF");
@@ -73,13 +107,16 @@ public:
                 return false;
             if (m_tracker.LockActive()) {
                 m_tracker.Unlock();
+                m_worker.enabled.store(false, std::memory_order_release);
                 lock_item->setValue("OFF");
                 m_status = "ONLINE";
             } else {
-                const Result rc = m_tracker.LockPercentages(m_lock_pattern);
+                const Result rc = m_tracker.LockPercentage(m_lock_value);
+                if (m_tracker.LockActive() && m_worker_started)
+                    m_worker.enabled.store(true, std::memory_order_release);
                 lock_item->setValue(m_tracker.LockActive() ? "ON" : "ERROR");
                 m_status = m_tracker.LockActive()
-                    ? "ONLINE / LOCKED"
+                    ? (m_worker_started ? "ONLINE / LOCKED" : "LOCK THREAD ERROR")
                     : "LOCK ERROR: " + m_tracker.LockError();
                 m_last_rc = rc;
             }
@@ -104,16 +141,6 @@ public:
     }
 
 private:
-    void applyPattern(tsl::elm::ListItem* item) {
-        const uint32_t value = m_pattern_value[m_pattern_index];
-        const uint32_t next = value == 99 ? 0 : value + 1;
-        m_pattern_value[m_pattern_index] = next;
-        m_lock_pattern.resize(m_pattern_size);
-        for (size_t i = 0; i < m_pattern_size; ++i)
-            m_lock_pattern[i] = m_pattern_value[i];
-        item->setValue(std::to_string(next));
-    }
-
     void refreshGame() {
         if (!m_cfg_loaded) {
             m_status = "CONFIG ERROR";
@@ -301,10 +328,9 @@ private:
     bool m_cfg_loaded = false;
     std::string m_config_error;
     std::string m_status = "starting";
-    size_t m_pattern_index = 0;
-    size_t m_pattern_size = 1;
-    std::array<uint32_t, 3> m_pattern_value{99, 60, 70};
-    std::vector<uint32_t> m_lock_pattern{99};
+    uint32_t m_lock_value = 99;
+    LockWorker m_worker;
+    bool m_worker_started = false;
     Result m_last_rc = 0;
     u64 m_last_tick = 0;
 };

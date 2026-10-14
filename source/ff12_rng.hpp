@@ -7,7 +7,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace ff12 {
 
@@ -62,11 +61,11 @@ public:
     double SuccessProbability() const;
     bool IsSuccessPercent(uint32_t percent) const;
     uint64_t GetNextMatch(size_t max_positions) const;
-    Result LockPercentages(const std::vector<uint32_t>& percentages);
+    Result LockPercentage(uint32_t percentage);
     Result MaintainLock();
     void Unlock();
     bool LockActive() const { return m_lock_active; }
-    const std::vector<uint32_t>& LockPattern() const { return m_lock_pattern; }
+    uint32_t LockPercentage() const { return m_lock_percentage; }
     const std::string& LockError() const { return m_lock_error; }
 
 private:
@@ -84,7 +83,7 @@ private:
     std::array<uint32_t, MT_N> m_prev_state{};
     bool m_have_prev = false;
     bool m_lock_active = false;
-    std::vector<uint32_t> m_lock_pattern;
+    uint32_t m_lock_percentage = 0;
     std::string m_lock_error;
 };
 
